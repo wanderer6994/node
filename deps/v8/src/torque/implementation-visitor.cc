@@ -1533,12 +1533,13 @@ std::vector<std::string> ImplementationVisitor::GenerateFunctionDeclaration(
 
 namespace {
 
-void FailCallableLookup(const std::string& reason, const QualifiedName& name,
-                        const TypeVector& parameter_types,
-                        const std::vector<Binding<LocalLabel>*>& labels,
-                        const std::vector<Signature>& candidates,
-                        const std::vector<std::tuple<Generic*, const char*>>
-                            inapplicable_generics) {
+void FailCallableLookup(
+    const std::string& reason, const QualifiedName& name,
+    const TypeVector& parameter_types,
+    const std::vector<Binding<LocalLabel>*>& labels,
+    const std::vector<Signature>& candidates,
+    const std::vector<std::pair<GenericCallable*, std::string>>
+        inapplicable_generics) {
   std::stringstream stream;
   stream << "\n" << reason << ": \n  " << name << "(" << parameter_types << ")";
   if (labels.size() != 0) {
@@ -1555,9 +1556,8 @@ void FailCallableLookup(const std::string& reason, const QualifiedName& name,
   if (inapplicable_generics.size() != 0) {
     stream << "\nfailed to instantiate all of these generic declarations:";
     for (auto& failure : inapplicable_generics) {
-      Generic* generic;
-      const char* reason;
-      std::tie(generic, reason) = failure;
+      GenericCallable* generic = failure.first;
+      const std::string& reason = failure.second;
       stream << "\n  " << generic->name() << " defined at "
              << generic->Position() << ":\n    " << reason << "\n";
     }
@@ -1565,9 +1565,10 @@ void FailCallableLookup(const std::string& reason, const QualifiedName& name,
   ReportError(stream.str());
 }
 
-Callable* GetOrCreateSpecialization(const SpecializationKey<Generic>& key) {
+Callable* GetOrCreateSpecialization(
+    const SpecializationKey<GenericCallable>& key) {
   if (base::Optional<Callable*> specialization =
-          key.generic->specializations().Get(key.specialized_types)) {
+          key.generic->GetSpecialization(key.specialized_types)) {
     return *specialization;
   }
   return DeclarationVisitor::SpecializeImplicit(key);
@@ -1621,20 +1622,21 @@ Callable* ImplementationVisitor::LookupCallable(
 
   std::vector<Declarable*> overloads;
   std::vector<Signature> overload_signatures;
-  std::vector<std::tuple<Generic*, const char*>> inapplicable_generics;
+  std::vector<std::pair<GenericCallable*, std::string>> inapplicable_generics;
   for (auto* declarable : declaration_container) {
-    if (Generic* generic = Generic::DynamicCast(declarable)) {
+    if (GenericCallable* generic = GenericCallable::DynamicCast(declarable)) {
       TypeArgumentInference inference = generic->InferSpecializationTypes(
           specialization_types, parameter_types);
       if (inference.HasFailed()) {
         inapplicable_generics.push_back(
-            std::make_tuple(generic, inference.GetFailureReason()));
+            std::make_pair(generic, inference.GetFailureReason()));
         continue;
       }
       overloads.push_back(generic);
       overload_signatures.push_back(
           DeclarationVisitor::MakeSpecializedSignature(
-              SpecializationKey<Generic>{generic, inference.GetResult()}));
+              SpecializationKey<GenericCallable>{generic,
+                                                 inference.GetResult()}));
     } else if (Callable* callable = Callable::DynamicCast(declarable)) {
       overloads.push_back(callable);
       overload_signatures.push_back(callable->signature());
@@ -1683,11 +1685,12 @@ Callable* ImplementationVisitor::LookupCallable(
     }
   }
 
-  if (Generic* generic = Generic::DynamicCast(overloads[best])) {
+  if (GenericCallable* generic =
+          GenericCallable::DynamicCast(overloads[best])) {
     TypeArgumentInference inference = generic->InferSpecializationTypes(
         specialization_types, parameter_types);
     result = GetOrCreateSpecialization(
-        SpecializationKey<Generic>{generic, inference.GetResult()});
+        SpecializationKey<GenericCallable>{generic, inference.GetResult()});
   } else {
     result = Callable::cast(overloads[best]);
   }
@@ -1936,9 +1939,9 @@ LocationReference ImplementationVisitor::GetLocationReference(
                                         "builtin " + expr->name->value);
   }
   if (expr->generic_arguments.size() != 0) {
-    Generic* generic = Declarations::LookupUniqueGeneric(name);
+    GenericCallable* generic = Declarations::LookupUniqueGeneric(name);
     Callable* specialization =
-        GetOrCreateSpecialization(SpecializationKey<Generic>{
+        GetOrCreateSpecialization(SpecializationKey<GenericCallable>{
             generic, TypeVisitor::ComputeTypeVector(expr->generic_arguments)});
     if (Builtin* builtin = Builtin::DynamicCast(specialization)) {
       DCHECK(!builtin->IsExternal());
@@ -1974,8 +1977,7 @@ LocationReference ImplementationVisitor::GetLocationReference(
 LocationReference ImplementationVisitor::GetLocationReference(
     DereferenceExpression* expr) {
   VisitResult ref = Visit(expr->reference);
-  if (!StructType::MatchUnaryGeneric(ref.type(),
-                                     TypeOracle::GetReferenceGeneric())) {
+  if (!Type::MatchUnaryGeneric(ref.type(), TypeOracle::GetReferenceGeneric())) {
     ReportError("Operator * expects a reference but found a value of type ",
                 *ref.type());
   }
@@ -2654,8 +2656,8 @@ void ImplementationVisitor::Visit(Declarable* declarable) {
     case Declarable::kIntrinsic:
     case Declarable::kExternConstant:
     case Declarable::kNamespace:
-    case Declarable::kGeneric:
-    case Declarable::kGenericStructType:
+    case Declarable::kGenericCallable:
+    case Declarable::kGenericType:
       return;
   }
 }
@@ -3143,9 +3145,6 @@ void CppClassGenerator::GenerateClassConstructors() {
   hdr_ << "      \"class " << gen_name_ << " should be used as direct base for "
        << name_ << ".\");\n";
   hdr_ << "  }\n";
-  hdr_ << "  D* operator->() { return static_cast<D*>(this); }\n";
-  hdr_ << "  const D* operator->() const { return static_cast<const D*>(this); "
-          "}\n\n";
 
   hdr_ << "protected:\n";
   hdr_ << "  inline explicit " << gen_name_ << "(Address ptr);\n";
@@ -3166,7 +3165,7 @@ void CppClassGenerator::GenerateClassConstructors() {
 // TODO(sigurds): Keep in sync with DECL_ACCESSORS and ACCESSORS macro.
 void CppClassGenerator::GenerateFieldAccessor(const Field& f) {
   const Type* field_type = f.name_and_type.type;
-  if (field_type == TypeOracle::GetVoidType()) return;
+  if (field_type == TypeOracle::GetVoidType() || f.index.has_value()) return;
   if (!f.name_and_type.type->IsSubtypeOf(TypeOracle::GetTaggedType())) {
     return GenerateFieldAccessorForUntagged(f);
   }
@@ -3262,9 +3261,9 @@ void CppClassGenerator::GenerateFieldAccessorForObject(const Field& f) {
        << " value, WriteBarrierMode mode = UPDATE_WRITE_BARRIER);\n\n";
 
   std::string type_check;
-  for (const std::string& runtime_type : field_type->GetRuntimeTypes()) {
+  for (const RuntimeType& runtime_type : field_type->GetRuntimeTypes()) {
     if (!type_check.empty()) type_check += " || ";
-    type_check += "value.Is" + runtime_type + "()";
+    type_check += "value.Is" + runtime_type.type + "()";
   }
 
   // Generate implementation in inline header.
@@ -3444,14 +3443,16 @@ void GenerateClassFieldVerifier(const std::string& class_name,
   if (!f.generate_verify) return;
   const Type* field_type = f.name_and_type.type;
 
-  // We only verify tagged types, not raw numbers or pointers. Note that this
-  // must check against GetObjectType not GetTaggedType, because Uninitialized
-  // is a Tagged but should not be verified.
-  if (!field_type->IsSubtypeOf(TypeOracle::GetObjectType())) return;
+  // We only verify tagged types, not raw numbers or pointers.
+  if (!field_type->IsSubtypeOf(TypeOracle::GetTaggedType())) return;
+  // Do not verify if the field may be uninitialized.
+  if (TypeOracle::GetUninitializedType()->IsSubtypeOf(field_type)) return;
 
   if (f.index) {
-    if (f.index->type != TypeOracle::GetSmiType()) {
-      ReportError("Non-SMI values are not (yet) supported as indexes.");
+    const Type* index_type = f.index->type;
+    if (index_type != TypeOracle::GetSmiType()) {
+      Error("Expected type Smi for indexed field but found type ", *index_type)
+          .Position(f.pos);
     }
     // We already verified the index field because it was listed earlier, so we
     // can assume it's safe to read here.
@@ -3462,9 +3463,11 @@ void GenerateClassFieldVerifier(const std::string& class_name,
     cc_contents << "  {\n";
   }
 
-  const char* object_type = f.is_weak ? "MaybeObject" : "Object";
+  bool maybe_object =
+      !f.name_and_type.type->IsSubtypeOf(TypeOracle::GetStrongTaggedType());
+  const char* object_type = maybe_object ? "MaybeObject" : "Object";
   const char* verify_fn =
-      f.is_weak ? "VerifyMaybeObjectPointer" : "VerifyPointer";
+      maybe_object ? "VerifyMaybeObjectPointer" : "VerifyPointer";
   const char* index_offset = f.index ? "i * kTaggedSize" : "0";
   // Name the local var based on the field name for nicer CHECK output.
   const std::string value = f.name_and_type.name + "__value";
@@ -3483,14 +3486,34 @@ void GenerateClassFieldVerifier(const std::string& class_name,
   // the Object type because it would not check anything beyond what we already
   // checked with VerifyPointer.
   if (f.name_and_type.type != TypeOracle::GetObjectType()) {
-    std::string type_check = f.is_weak ? value + ".IsWeakOrCleared()" : "";
-    std::string strong_value =
-        value + (f.is_weak ? ".GetHeapObjectOrSmi()" : "");
-    for (const std::string& runtime_type : field_type->GetRuntimeTypes()) {
-      if (!type_check.empty()) type_check += " || ";
-      type_check += strong_value + ".Is" + runtime_type + "()";
+    std::stringstream type_check;
+    bool at_start = true;
+    // If weak pointers are allowed, then start by checking for a cleared value.
+    if (maybe_object) {
+      type_check << value << ".IsCleared()";
+      at_start = false;
     }
-    cc_contents << "    CHECK(" << type_check << ");\n";
+    for (const RuntimeType& runtime_type : field_type->GetRuntimeTypes()) {
+      if (!at_start) type_check << " || ";
+      at_start = false;
+      if (maybe_object) {
+        bool strong = runtime_type.weak_ref_to.empty();
+        if (strong && runtime_type.type == "MaybeObject") {
+          // Rather than a generic Weak<T>, this is a basic type Tagged or
+          // WeakHeapObject. We can't validate anything more about the type of
+          // the object pointed to, so just check that it's weak.
+          type_check << value << ".IsWeak()";
+        } else {
+          type_check << "(" << (strong ? "!" : "") << value << ".IsWeak() && "
+                     << value << ".GetHeapObjectOrSmi().Is"
+                     << (strong ? runtime_type.type : runtime_type.weak_ref_to)
+                     << "())";
+        }
+      } else {
+        type_check << value << ".Is" << runtime_type.type << "()";
+      }
+    }
+    cc_contents << "    CHECK(" << type_check.str() << ");\n";
   }
   cc_contents << "  }\n";
 }

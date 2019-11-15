@@ -6,9 +6,7 @@
 
 namespace regexp {
 
-  extern transitioning macro RegExpBuiltinsAssembler::RegExpPrototypeExecBody(
-      implicit context: Context)(JSReceiver, String, constexpr bool): JSAny;
-
+  @export
   transitioning macro RegExpPrototypeExecBodyFast(implicit context: Context)(
       receiver: JSReceiver, string: String): JSAny {
     return RegExpPrototypeExecBody(receiver, string, true);
@@ -36,7 +34,7 @@ namespace regexp {
     // Ensure {receiver} is a JSRegExp.
     const receiver = Cast<JSRegExp>(receiver) otherwise ThrowTypeError(
         kIncompatibleMethodReceiver, 'RegExp.prototype.exec', receiver);
-    const string = ToString_Inline(context, string);
+    const string = ToString_Inline(string);
 
     return IsFastRegExpNoPrototype(receiver) ?
         RegExpPrototypeExecBodyFast(receiver, string) :

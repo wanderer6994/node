@@ -175,6 +175,7 @@
   V(JSGetSuperConstructor)
 
 #define JS_CONTEXT_OP_LIST(V) \
+  V(JSHasContextExtension)    \
   V(JSLoadContext)            \
   V(JSStoreContext)           \
   V(JSCreateFunctionContext)  \
@@ -233,7 +234,6 @@
 
 // Opcodes for VirtuaMachine-level operators.
 #define SIMPLIFIED_CHANGE_OP_LIST(V) \
-  V(ChangeCompressedSignedToInt32)   \
   V(ChangeTaggedSignedToInt32)       \
   V(ChangeTaggedSignedToInt64)       \
   V(ChangeTaggedToInt32)             \
@@ -241,9 +241,6 @@
   V(ChangeTaggedToUint32)            \
   V(ChangeTaggedToFloat64)           \
   V(ChangeTaggedToTaggedSigned)      \
-  V(ChangeCompressedToTaggedSigned)  \
-  V(ChangeTaggedToCompressedSigned)  \
-  V(ChangeInt31ToCompressedSigned)   \
   V(ChangeInt31ToTaggedSigned)       \
   V(ChangeInt32ToTagged)             \
   V(ChangeInt64ToTagged)             \
@@ -268,7 +265,6 @@
   V(CheckedUint32Div)                 \
   V(CheckedUint32Mod)                 \
   V(CheckedInt32Mul)                  \
-  V(CheckedInt32ToCompressedSigned)   \
   V(CheckedInt32ToTaggedSigned)       \
   V(CheckedInt64ToInt32)              \
   V(CheckedInt64ToTaggedSigned)       \
@@ -282,15 +278,12 @@
   V(CheckedFloat64ToInt64)            \
   V(CheckedTaggedSignedToInt32)       \
   V(CheckedTaggedToInt32)             \
+  V(CheckedTaggedToArrayIndex)        \
   V(CheckedTruncateTaggedToWord32)    \
   V(CheckedTaggedToFloat64)           \
   V(CheckedTaggedToInt64)             \
   V(CheckedTaggedToTaggedSigned)      \
-  V(CheckedTaggedToTaggedPointer)     \
-  V(CheckedCompressedToTaggedSigned)  \
-  V(CheckedCompressedToTaggedPointer) \
-  V(CheckedTaggedToCompressedSigned)  \
-  V(CheckedTaggedToCompressedPointer)
+  V(CheckedTaggedToTaggedPointer)
 
 #define SIMPLIFIED_COMPARE_BINOP_LIST(V) \
   V(NumberEqual)                         \
@@ -679,8 +672,6 @@
   V(BitcastTaggedToWordForTagAndSmiBits)    \
   V(BitcastWordToTagged)                    \
   V(BitcastWordToTaggedSigned)              \
-  V(BitcastWord32ToCompressedSigned)        \
-  V(BitcastCompressedSignedToWord32)        \
   V(TruncateFloat64ToWord32)                \
   V(ChangeFloat32ToFloat64)                 \
   V(ChangeFloat64ToInt32)                   \
@@ -702,11 +693,6 @@
   V(ChangeUint32ToFloat64)                  \
   V(ChangeUint32ToUint64)                   \
   V(ChangeTaggedToCompressed)               \
-  V(ChangeTaggedPointerToCompressedPointer) \
-  V(ChangeTaggedSignedToCompressedSigned)   \
-  V(ChangeCompressedToTagged)               \
-  V(ChangeCompressedPointerToTaggedPointer) \
-  V(ChangeCompressedSignedToTaggedSigned)   \
   V(TruncateFloat64ToFloat32)               \
   V(TruncateInt64ToInt32)                   \
   V(RoundFloat64ToInt32)                    \
@@ -727,6 +713,7 @@
   V(TaggedPoisonOnSpeculation)              \
   V(Word32PoisonOnSpeculation)              \
   V(Word64PoisonOnSpeculation)              \
+  V(LoadStackCheckOffset)                   \
   V(LoadFramePointer)                       \
   V(LoadParentFramePointer)                 \
   V(UnalignedLoad)                          \
@@ -750,6 +737,8 @@
 
 #define MACHINE_SIMD_OP_LIST(V) \
   V(F64x2Splat)                 \
+  V(F64x2SConvertI64x2)         \
+  V(F64x2UConvertI64x2)         \
   V(F64x2ExtractLane)           \
   V(F64x2ReplaceLane)           \
   V(F64x2Abs)                   \
@@ -793,8 +782,10 @@
   V(F32x4Qfma)                  \
   V(F32x4Qfms)                  \
   V(I64x2Splat)                 \
+  V(I64x2SplatI32Pair)          \
   V(I64x2ExtractLane)           \
   V(I64x2ReplaceLane)           \
+  V(I64x2ReplaceLaneI32Pair)    \
   V(I64x2Neg)                   \
   V(I64x2Shl)                   \
   V(I64x2ShrS)                  \
@@ -925,7 +916,8 @@
   V(S1x8AnyTrue)                \
   V(S1x8AllTrue)                \
   V(S1x16AnyTrue)               \
-  V(S1x16AllTrue)
+  V(S1x16AllTrue)               \
+  V(LoadTransform)
 
 #define VALUE_OP_LIST(V)  \
   COMMON_OP_LIST(V)       \
@@ -1009,18 +1001,6 @@ class V8_EXPORT_PRIVATE IrOpcode {
     return (kJSEqual <= value && value <= kJSGreaterThanOrEqual) ||
            (kNumberEqual <= value && value <= kStringLessThanOrEqual) ||
            (kWord32Equal <= value && value <= kFloat64LessThanOrEqual);
-  }
-
-  // Returns true if opcode for decompress operator.
-  static bool IsDecompressOpcode(Value value) {
-    return kChangeCompressedToTagged <= value &&
-           value <= kChangeCompressedSignedToTaggedSigned;
-  }
-
-  // Returns true if opcode for compress operator.
-  static bool IsCompressOpcode(Value value) {
-    return kChangeTaggedToCompressed <= value &&
-           value <= kChangeTaggedSignedToCompressedSigned;
   }
 
   static bool IsContextChainExtendingOpcode(Value value) {

@@ -1188,6 +1188,9 @@ void BytecodeGenerator::GenerateBytecode(uintptr_t stack_limit) {
 
   AllocateTopLevelRegisters();
 
+  // Perform a stack-check before the body.
+  builder()->StackCheck(info()->literal()->start_position());
+
   if (info()->literal()->CanSuspend()) {
     BuildGeneratorPrologue();
   }
@@ -1251,9 +1254,6 @@ void BytecodeGenerator::GenerateBytecodeBody() {
 
   // Emit initializing assignments for module namespace imports (if any).
   VisitModuleNamespaceImports();
-
-  // Perform a stack-check before the body.
-  builder()->StackCheck(literal->start_position());
 
   // The derived constructor case is handled in VisitCallSuper.
   if (IsBaseConstructor(function_kind())) {
@@ -1363,6 +1363,9 @@ void BytecodeGenerator::VisitVariableDeclaration(VariableDeclaration* decl) {
         builder()->LoadTheHole().StoreAccumulatorInRegister(destination);
       }
       break;
+    case VariableLocation::REPL_GLOBAL:
+      // REPL let's are stored in script contexts. They get initialized
+      // with the hole the same way as normal context allocated variables.
     case VariableLocation::CONTEXT:
       if (variable->binding_needs_init()) {
         DCHECK_EQ(0, execution_context()->ContextChainDepth(variable->scope()));
@@ -1416,6 +1419,7 @@ void BytecodeGenerator::VisitFunctionDeclaration(FunctionDeclaration* decl) {
       BuildVariableAssignment(variable, Token::INIT, HoleCheckMode::kElided);
       break;
     }
+    case VariableLocation::REPL_GLOBAL:
     case VariableLocation::CONTEXT: {
       DCHECK_EQ(0, execution_context()->ContextChainDepth(variable->scope()));
       VisitFunctionLiteral(decl->fun());
@@ -2055,7 +2059,7 @@ void BytecodeGenerator::BuildClassLiteral(ClassLiteral* expr, Register name) {
     builder()
         ->LoadLiteral(class_name)
         .StoreAccumulatorInRegister(brand)
-        .CallRuntime(Runtime::kCreatePrivateNameSymbol, brand);
+        .CallRuntime(Runtime::kCreatePrivateBrandSymbol, brand);
     BuildVariableAssignment(expr->scope()->brand(), Token::INIT,
                             HoleCheckMode::kElided);
   }
@@ -3066,6 +3070,13 @@ void BytecodeGenerator::BuildVariableLoad(Variable* variable,
       }
       break;
     }
+    case VariableLocation::REPL_GLOBAL: {
+      DCHECK(variable->IsReplGlobalLet());
+      FeedbackSlot slot = GetCachedLoadGlobalICSlot(typeof_mode, variable);
+      builder()->LoadGlobal(variable->raw_name(), feedback_index(slot),
+                            typeof_mode);
+      break;
+    }
   }
 }
 
@@ -3246,6 +3257,33 @@ void BytecodeGenerator::BuildVariableAssignment(
         builder()->LoadAccumulatorWithRegister(value_temp);
       }
       builder()->StoreModuleVariable(variable->index(), depth);
+      break;
+    }
+    case VariableLocation::REPL_GLOBAL: {
+      // A let declaration like 'let x = 7' is effectively translated to:
+      //   <top of the script>:
+      //     ScriptContext.x = TheHole;
+      //   ...
+      //   <where the actual 'let' is>:
+      //     ScriptContextTable.x = 7; // no hole check
+      //
+      // The ScriptContext slot for 'x' that we store to here is not
+      // necessarily the ScriptContext of this script, but rather the
+      // first ScriptContext that has a slot for name 'x'.
+      DCHECK(variable->IsReplGlobalLet());
+      if (op == Token::INIT) {
+        RegisterList store_args = register_allocator()->NewRegisterList(2);
+        builder()
+            ->StoreAccumulatorInRegister(store_args[1])
+            .LoadLiteral(variable->raw_name())
+            .StoreAccumulatorInRegister(store_args[0]);
+        builder()->CallRuntime(Runtime::kStoreGlobalNoHoleCheckForReplLet,
+                               store_args);
+      } else {
+        FeedbackSlot slot =
+            GetCachedStoreGlobalICSlot(language_mode(), variable);
+        builder()->StoreGlobal(variable->raw_name(), feedback_index(slot));
+      }
       break;
     }
   }

@@ -6,6 +6,7 @@
 
 #include <ostream>
 
+#include "src/base/bits.h"
 #include "src/codegen/code-factory.h"
 #include "src/codegen/interface-descriptors.h"
 #include "src/codegen/machine-type.h"
@@ -504,7 +505,7 @@ TNode<IntPtrT> CodeAssembler::IntPtrDiv(TNode<IntPtrT> left,
       return IntPtrConstant(left_constant / right_constant);
     }
     if (base::bits::IsPowerOfTwo(right_constant)) {
-      return WordSar(left, WhichPowerOf2(right_constant));
+      return WordSar(left, base::bits::WhichPowerOfTwo(right_constant));
     }
   }
   return UncheckedCast<IntPtrT>(raw_assembler()->IntPtrDiv(left, right));
@@ -539,11 +540,11 @@ TNode<WordT> CodeAssembler::IntPtrMul(SloppyTNode<WordT> left,
       return IntPtrConstant(left_constant * right_constant);
     }
     if (base::bits::IsPowerOfTwo(left_constant)) {
-      return WordShl(right, WhichPowerOf2(left_constant));
+      return WordShl(right, base::bits::WhichPowerOfTwo(left_constant));
     }
   } else if (is_right_constant) {
     if (base::bits::IsPowerOfTwo(right_constant)) {
-      return WordShl(left, WhichPowerOf2(right_constant));
+      return WordShl(left, base::bits::WhichPowerOfTwo(right_constant));
     }
   }
   return UncheckedCast<IntPtrT>(raw_assembler()->IntPtrMul(left, right));
@@ -1234,12 +1235,6 @@ TNode<Object> CodeAssembler::CallRuntimeImpl(
   int result_size = Runtime::FunctionForId(function)->result_size;
   TNode<Code> centry =
       HeapConstant(CodeFactory::RuntimeCEntry(isolate(), result_size));
-  return CallRuntimeWithCEntryImpl(function, centry, context, args);
-}
-
-TNode<Object> CodeAssembler::CallRuntimeWithCEntryImpl(
-    Runtime::FunctionId function, TNode<Code> centry, TNode<Object> context,
-    std::initializer_list<TNode<Object>> args) {
   constexpr size_t kMaxNumArgs = 6;
   DCHECK_GE(kMaxNumArgs, args.size());
   int argc = static_cast<int>(args.size());
@@ -1273,12 +1268,6 @@ void CodeAssembler::TailCallRuntimeImpl(
   int result_size = Runtime::FunctionForId(function)->result_size;
   TNode<Code> centry =
       HeapConstant(CodeFactory::RuntimeCEntry(isolate(), result_size));
-  return TailCallRuntimeWithCEntryImpl(function, arity, centry, context, args);
-}
-
-void CodeAssembler::TailCallRuntimeWithCEntryImpl(
-    Runtime::FunctionId function, TNode<Int32T> arity, TNode<Code> centry,
-    TNode<Object> context, std::initializer_list<TNode<Object>> args) {
   constexpr size_t kMaxNumArgs = 6;
   DCHECK_GE(kMaxNumArgs, args.size());
   int argc = static_cast<int>(args.size());
@@ -1310,7 +1299,13 @@ Node* CodeAssembler::CallStubN(StubCallMode call_mode,
   int implicit_nodes = descriptor.HasContextParameter() ? 2 : 1;
   DCHECK_LE(implicit_nodes, input_count);
   int argc = input_count - implicit_nodes;
-  DCHECK_LE(descriptor.GetParameterCount(), argc);
+#ifdef DEBUG
+  if (descriptor.AllowVarArgs()) {
+    DCHECK_LE(descriptor.GetParameterCount(), argc);
+  } else {
+    DCHECK_EQ(descriptor.GetParameterCount(), argc);
+  }
+#endif
   // Extra arguments not mentioned in the descriptor are passed on the stack.
   int stack_parameter_count = argc - descriptor.GetRegisterParameterCount();
   DCHECK_LE(descriptor.GetStackParameterCount(), stack_parameter_count);

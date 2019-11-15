@@ -162,7 +162,7 @@ class InterpreterLoadGlobalAssembler : public InterpreterAssembler {
     TNode<HeapObject> maybe_feedback_vector = LoadFeedbackVector();
 
     AccessorAssembler accessor_asm(state());
-    ExitPoint exit_point(this, [=](Node* result) {
+    ExitPoint exit_point(this, [=](TNode<Object> result) {
       SetAccumulator(result);
       Dispatch();
     });
@@ -1692,7 +1692,7 @@ IGNITION_HANDLER(CallRuntime, InterpreterAssembler) {
   TNode<Uint32T> function_id = BytecodeOperandRuntimeId(0);
   RegListNodePair args = GetRegisterListAtOperandIndex(1);
   TNode<Context> context = GetContext();
-  Node* result = CallRuntimeN(function_id, context, args);
+  TNode<Object> result = CAST(CallRuntimeN(function_id, context, args));
   SetAccumulator(result);
   Dispatch();
 }
@@ -2537,9 +2537,10 @@ IGNITION_HANDLER(CreateEmptyArrayLiteral, InterpreterAssembler) {
   {
     TNode<Map> array_map = LoadJSArrayElementsMap(GetInitialFastElementsKind(),
                                                   LoadNativeContext(context));
-    result =
-        AllocateJSArray(GetInitialFastElementsKind(), array_map, SmiConstant(0),
-                        SmiConstant(0), {}, ParameterMode::SMI_PARAMETERS);
+    TNode<Smi> length = SmiConstant(0);
+    TNode<IntPtrT> capacity = IntPtrConstant(0);
+    result = AllocateJSArray(GetInitialFastElementsKind(), array_map, capacity,
+                             length);
     Goto(&end);
   }
 

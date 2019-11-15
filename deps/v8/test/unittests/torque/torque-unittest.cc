@@ -27,11 +27,16 @@ namespace torque_internal {
   }
 }
 
-type Tagged generates 'TNode<Object>' constexpr 'ObjectPtr';
-type Smi extends Tagged generates 'TNode<Smi>' constexpr 'Smi';
+type Tagged generates 'TNode<MaybeObject>' constexpr 'MaybeObject';
+type StrongTagged extends Tagged
+    generates 'TNode<Object>' constexpr 'ObjectPtr';
+type Smi extends StrongTagged generates 'TNode<Smi>' constexpr 'Smi';
+type WeakHeapObject extends Tagged;
+type Weak<T : type extends HeapObject> extends WeakHeapObject;
+type Uninitialized extends Tagged;
 
 @abstract
-extern class HeapObject extends Tagged {
+extern class HeapObject extends StrongTagged {
   map: Map;
 }
 type Map extends HeapObject generates 'TNode<Map>';
@@ -64,6 +69,8 @@ type Code extends HeapObject generates 'TNode<Code>';
 type BuiltinPtr extends Smi generates 'TNode<BuiltinPtr>';
 type Context extends HeapObject generates 'TNode<Context>';
 type NativeContext extends Context;
+
+macro FromConstexpr<To: type, From: type>(o: From): To;
 )";
 
 TorqueCompilerResult TestCompileTorque(std::string source) {
@@ -316,6 +323,39 @@ TEST(Torque, LetShouldBeConstIsSkippedForStructs) {
       return foo;
     }
   )");
+}
+
+TEST(Torque, GenericAbstractType) {
+  ExpectSuccessfulCompilation(R"(
+    type Foo<T: type> extends HeapObject;
+    extern macro F1(HeapObject);
+    macro F2<T: type>(x: Foo<T>) {
+      F1(x);
+    }
+    @export
+    macro F3(a: Foo<Smi>, b: Foo<HeapObject>){
+      F2(a);
+      F2(b);
+    }
+  )");
+
+  ExpectFailingCompilation(R"(
+    type Foo<T: type> extends HeapObject;
+    macro F1<T: type>(x: Foo<T>) {}
+    @export
+    macro F2(a: Foo<Smi>) {
+      F1<HeapObject>(a);
+    })",
+                           HasSubstr("cannot find suitable callable"));
+
+  ExpectFailingCompilation(R"(
+    type Foo<T: type> extends HeapObject;
+    extern macro F1(Foo<HeapObject>);
+    @export
+    macro F2(a: Foo<Smi>) {
+      F1(a);
+    })",
+                           HasSubstr("cannot find suitable callable"));
 }
 
 }  // namespace torque

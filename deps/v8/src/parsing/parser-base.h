@@ -3260,7 +3260,13 @@ ParserBase<Impl>::ParseLeftHandSideContinuation(ExpressionT result) {
         if (is_optional) {
           DCHECK_EQ(scanner()->current_token(), Token::QUESTION_PERIOD);
           int pos = position();
-          ExpressionT key = ParsePropertyOrPrivatePropertyName();
+          Token::Value next = Next();
+          if (V8_UNLIKELY(!Token::IsPropertyName(next))) {
+            ReportUnexpectedToken(next);
+            return impl()->FailureExpression();
+          }
+          IdentifierT name = impl()->GetSymbol();
+          ExpressionT key = factory()->NewStringLiteral(name, position());
           result = factory()->NewProperty(result, key, pos, is_optional);
           break;
         }
@@ -4108,6 +4114,7 @@ void ParserBase<Impl>::ParseFunctionBody(
       inner_body.Rewind();
       inner_body.Add(inner_block);
       inner_block->set_scope(inner_scope);
+      impl()->RecordBlockSourceRange(inner_block, scope()->end_position());
       if (!impl()->HasCheckedSyntax()) {
         const AstRawString* conflict = inner_scope->FindVariableDeclaredIn(
             function_scope, VariableMode::kLastLexicalVariableMode);

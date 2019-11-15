@@ -97,10 +97,6 @@ enum class ClearFreedMemoryMode { kClearFreedMemory, kDontClearFreedMemory };
 
 enum ExternalBackingStoreType { kArrayBuffer, kExternalString, kNumTypes };
 
-enum class FixedArrayVisitationMode { kRegular, kIncremental };
-
-enum class TraceRetainingPathMode { kEnabled, kDisabled };
-
 enum class RetainingPathOption { kDefault, kTrackEphemeronPath };
 
 enum class AllocationOrigin {
@@ -680,7 +676,7 @@ class Heap {
   OldSpace* old_space() { return old_space_; }
   CodeSpace* code_space() { return code_space_; }
   MapSpace* map_space() { return map_space_; }
-  LargeObjectSpace* lo_space() { return lo_space_; }
+  OldLargeObjectSpace* lo_space() { return lo_space_; }
   CodeLargeObjectSpace* code_lo_space() { return code_lo_space_; }
   NewLargeObjectSpace* new_lo_space() { return new_lo_space_; }
   ReadOnlySpace* read_only_space() { return read_only_space_; }
@@ -1878,7 +1874,7 @@ class Heap {
   OldSpace* old_space_ = nullptr;
   CodeSpace* code_space_ = nullptr;
   MapSpace* map_space_ = nullptr;
-  LargeObjectSpace* lo_space_ = nullptr;
+  OldLargeObjectSpace* lo_space_ = nullptr;
   CodeLargeObjectSpace* code_lo_space_ = nullptr;
   NewLargeObjectSpace* new_lo_space_ = nullptr;
   ReadOnlySpace* read_only_space_ = nullptr;
@@ -1979,7 +1975,7 @@ class Heap {
   unsigned int maximum_size_scavenges_ = 0;
 
   // Total time spent in GC.
-  double total_gc_time_ms_;
+  double total_gc_time_ms_ = 0.0;
 
   // Last time an idle notification happened.
   double last_idle_notification_time_ = 0.0;
@@ -2098,10 +2094,9 @@ class Heap {
   friend class IdleScavengeObserver;
   friend class IncrementalMarking;
   friend class IncrementalMarkingJob;
-  friend class LargeObjectSpace;
-  template <FixedArrayVisitationMode fixed_array_mode,
-            TraceRetainingPathMode retaining_path_mode, typename MarkingState>
-  friend class MarkingVisitor;
+  friend class OldLargeObjectSpace;
+  template <typename ConcreteVisitor, typename MarkingState>
+  friend class MarkingVisitorBase;
   friend class MarkCompactCollector;
   friend class MarkCompactCollectorBase;
   friend class MinorMarkCompactCollector;

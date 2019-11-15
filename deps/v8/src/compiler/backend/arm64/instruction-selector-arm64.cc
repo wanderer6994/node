@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include "src/base/bits.h"
 #include "src/codegen/assembler-inl.h"
 #include "src/compiler/backend/instruction-selector-impl.h"
 #include "src/compiler/node-matchers.h"
@@ -179,7 +180,7 @@ void VisitRRIR(InstructionSelector* selector, ArchOpcode opcode, Node* node) {
   int32_t imm = OpParameter<int32_t>(node->op());
   selector->Emit(opcode, g.DefineAsRegister(node),
                  g.UseRegister(node->InputAt(0)), g.UseImmediate(imm),
-                 g.UseRegister(node->InputAt(1)));
+                 g.UseUniqueRegister(node->InputAt(1)));
 }
 
 struct ExtendingLoadMatcher {
@@ -518,7 +519,7 @@ int32_t LeftShiftForReducedMultiply(Matcher* m) {
   if (m->right().HasValue() && m->right().Value() >= 3) {
     uint64_t value_minus_one = m->right().Value() - 1;
     if (base::bits::IsPowerOfTwo(value_minus_one)) {
-      return WhichPowerOf2(value_minus_one);
+      return base::bits::WhichPowerOfTwo(value_minus_one);
     }
   }
   return 0;
@@ -618,7 +619,6 @@ void InstructionSelector::VisitLoad(Node* node) {
       opcode = kArm64LdrW;
       immediate_mode = kLoadStoreImm32;
       break;
-    case MachineRepresentation::kCompressedSigned:   // Fall through.
     case MachineRepresentation::kCompressedPointer:  // Fall through.
     case MachineRepresentation::kCompressed:
 #ifdef V8_COMPRESS_POINTERS
@@ -735,7 +735,6 @@ void InstructionSelector::VisitStore(Node* node) {
         opcode = kArm64StrW;
         immediate_mode = kLoadStoreImm32;
         break;
-      case MachineRepresentation::kCompressedSigned:   // Fall through.
       case MachineRepresentation::kCompressedPointer:  // Fall through.
       case MachineRepresentation::kCompressed:
 #ifdef V8_COMPRESS_POINTERS
@@ -1028,11 +1027,31 @@ void InstructionSelector::VisitWord64Shl(Node* node) {
 
 void InstructionSelector::VisitStackPointerGreaterThan(
     Node* node, FlagsContinuation* cont) {
-  Node* const value = node->InputAt(0);
-  InstructionCode opcode = kArchStackPointerGreaterThan;
+  StackCheckKind kind = StackCheckKindOf(node->op());
+  InstructionCode opcode =
+      kArchStackPointerGreaterThan | MiscField::encode(static_cast<int>(kind));
 
   Arm64OperandGenerator g(this);
-  EmitWithContinuation(opcode, g.UseRegister(value), cont);
+
+  // No outputs.
+  InstructionOperand* const outputs = nullptr;
+  const int output_count = 0;
+
+  // Applying an offset to this stack check requires a temp register. Offsets
+  // are only applied to the first stack check. If applying an offset, we must
+  // ensure the input and temp registers do not alias, thus kUniqueRegister.
+  InstructionOperand temps[] = {g.TempRegister()};
+  const int temp_count = (kind == StackCheckKind::kJSFunctionEntry) ? 1 : 0;
+  const auto register_mode = (kind == StackCheckKind::kJSFunctionEntry)
+                                 ? OperandGenerator::kUniqueRegister
+                                 : OperandGenerator::kRegister;
+
+  Node* const value = node->InputAt(0);
+  InstructionOperand inputs[] = {g.UseRegisterWithMode(value, register_mode)};
+  static constexpr int input_count = arraysize(inputs);
+
+  EmitWithContinuation(opcode, output_count, outputs, input_count, inputs,
+                       temp_count, temps, cont);
 }
 
 namespace {
@@ -1675,87 +1694,6 @@ void InstructionSelector::VisitChangeTaggedToCompressed(Node* node) {
   // The top 32 bits in the 64-bit register will be undefined, and
   // must not be used by a dependent node.
   EmitIdentity(node);
-}
-
-void InstructionSelector::VisitChangeTaggedPointerToCompressedPointer(
-    Node* node) {
-  // The top 32 bits in the 64-bit register will be undefined, and
-  // must not be used by a dependent node.
-  EmitIdentity(node);
-}
-
-void InstructionSelector::VisitChangeTaggedSignedToCompressedSigned(
-    Node* node) {
-  // The top 32 bits in the 64-bit register will be undefined, and
-  // must not be used by a dependent node.
-  EmitIdentity(node);
-}
-
-void InstructionSelector::VisitChangeCompressedToTagged(Node* node) {
-  Arm64OperandGenerator g(this);
-  Node* const value = node->InputAt(0);
-  if ((value->opcode() == IrOpcode::kLoad ||
-       value->opcode() == IrOpcode::kPoisonedLoad) &&
-      CanCover(node, value)) {
-    DCHECK_EQ(LoadRepresentationOf(value->op()).representation(),
-              MachineRepresentation::kCompressed);
-    InstructionCode opcode = kArm64LdrDecompressAnyTagged;
-    if (value->opcode() == IrOpcode::kPoisonedLoad) {
-      CHECK_NE(poisoning_level_, PoisoningMitigationLevel::kDontPoison);
-      opcode |= MiscField::encode(kMemoryAccessPoisoned);
-    }
-    ImmediateMode immediate_mode = kLoadStoreImm32;
-    MachineRepresentation rep = MachineRepresentation::kCompressed;
-    EmitLoad(this, value, opcode, immediate_mode, rep, node);
-  } else {
-    Emit(kArm64DecompressAny, g.DefineAsRegister(node), g.UseRegister(value));
-  }
-}
-
-void InstructionSelector::VisitChangeCompressedPointerToTaggedPointer(
-    Node* node) {
-  Arm64OperandGenerator g(this);
-  Node* const value = node->InputAt(0);
-  if ((value->opcode() == IrOpcode::kLoad ||
-       value->opcode() == IrOpcode::kPoisonedLoad) &&
-      CanCover(node, value)) {
-    DCHECK_EQ(LoadRepresentationOf(value->op()).representation(),
-              MachineRepresentation::kCompressedPointer);
-    InstructionCode opcode = kArm64LdrDecompressTaggedPointer;
-    if (value->opcode() == IrOpcode::kPoisonedLoad) {
-      CHECK_NE(poisoning_level_, PoisoningMitigationLevel::kDontPoison);
-      opcode |= MiscField::encode(kMemoryAccessPoisoned);
-    }
-    ImmediateMode immediate_mode = kLoadStoreImm32;
-    MachineRepresentation rep = MachineRepresentation::kCompressedPointer;
-    EmitLoad(this, value, opcode, immediate_mode, rep, node);
-  } else {
-    Emit(kArm64DecompressPointer, g.DefineAsRegister(node),
-         g.UseRegister(value));
-  }
-}
-
-void InstructionSelector::VisitChangeCompressedSignedToTaggedSigned(
-    Node* node) {
-  Arm64OperandGenerator g(this);
-  Node* const value = node->InputAt(0);
-  if ((value->opcode() == IrOpcode::kLoad ||
-       value->opcode() == IrOpcode::kPoisonedLoad) &&
-      CanCover(node, value)) {
-    DCHECK_EQ(LoadRepresentationOf(value->op()).representation(),
-              MachineRepresentation::kCompressedSigned);
-    InstructionCode opcode = kArm64LdrDecompressTaggedSigned;
-    if (value->opcode() == IrOpcode::kPoisonedLoad) {
-      CHECK_NE(poisoning_level_, PoisoningMitigationLevel::kDontPoison);
-      opcode |= MiscField::encode(kMemoryAccessPoisoned);
-    }
-    ImmediateMode immediate_mode = kLoadStoreImm32;
-    MachineRepresentation rep = MachineRepresentation::kCompressedSigned;
-    EmitLoad(this, value, opcode, immediate_mode, rep, node);
-  } else {
-    Emit(kArm64DecompressSigned, g.DefineAsRegister(node),
-         g.UseRegister(value));
-  }
 }
 
 void InstructionSelector::VisitTruncateInt64ToInt32(Node* node) {

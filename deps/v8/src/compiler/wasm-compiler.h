@@ -44,6 +44,7 @@ using TFNode = compiler::Node;
 using TFGraph = compiler::MachineGraph;
 class WasmCode;
 struct WasmFeatures;
+enum class LoadTransformationKind : uint8_t;
 }  // namespace wasm
 
 namespace compiler {
@@ -226,15 +227,6 @@ class WasmGraphBuilder {
 
   void PatchInStackCheckIfNeeded();
 
-  // TODO(v8:8977, v8:7703): move this somewhere? This should be where it
-  // can be used in many places (e.g graph assembler, wasm compiler).
-  // Adds a decompression node if pointer compression is enabled and the type
-  // loaded is a compressed one. To be used after loads.
-  Node* InsertDecompressionIfNeeded(MachineType type, Node* value);
-  // Adds a compression node if pointer compression is enabled and the
-  // representation to be stored is a compressed one. To be used before stores.
-  Node* InsertCompressionIfNeeded(MachineRepresentation rep, Node* value);
-
   //-----------------------------------------------------------------------
   // Operations that read and/or write {control} and {effect}.
   //-----------------------------------------------------------------------
@@ -294,6 +286,10 @@ class WasmGraphBuilder {
   Node* LoadMem(wasm::ValueType type, MachineType memtype, Node* index,
                 uint32_t offset, uint32_t alignment,
                 wasm::WasmCodePosition position);
+  Node* LoadTransform(MachineType memtype,
+                      wasm::LoadTransformationKind transform, Node* index,
+                      uint32_t offset, uint32_t alignment,
+                      wasm::WasmCodePosition position);
   Node* StoreMem(MachineRepresentation mem_rep, Node* index, uint32_t offset,
                  uint32_t alignment, Node* val, wasm::WasmCodePosition position,
                  wasm::ValueType type);
@@ -403,8 +399,6 @@ class WasmGraphBuilder {
   Node* TableFill(uint32_t table_index, Node* start, Node* value, Node* count);
 
   bool has_simd() const { return has_simd_; }
-
-  const wasm::WasmModule* module() { return env_ ? env_->module : nullptr; }
 
   wasm::UseTrapHandler use_trap_handler() const {
     return env_ ? env_->use_trap_handler : wasm::kNoTrapHandler;

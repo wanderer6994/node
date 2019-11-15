@@ -32,6 +32,7 @@ static const char* const JSANY_TYPE_STRING = "JSAny";
 static const char* const JSOBJECT_TYPE_STRING = "JSObject";
 static const char* const SMI_TYPE_STRING = "Smi";
 static const char* const TAGGED_TYPE_STRING = "Tagged";
+static const char* const STRONG_TAGGED_TYPE_STRING = "StrongTagged";
 static const char* const UNINITIALIZED_TYPE_STRING = "Uninitialized";
 static const char* const RAWPTR_TYPE_STRING = "RawPtr";
 static const char* const CONST_STRING_TYPE_STRING = "constexpr string";
@@ -53,7 +54,9 @@ static const char* const CONST_FLOAT64_TYPE_STRING = "constexpr float64";
 static const char* const TORQUE_INTERNAL_NAMESPACE_STRING = "torque_internal";
 static const char* const REFERENCE_TYPE_STRING = "Reference";
 static const char* const SLICE_TYPE_STRING = "Slice";
-static const char* const STRUCT_NAMESPACE_STRING = "_struct";
+static const char* const WEAK_TYPE_STRING = "Weak";
+static const char* const GENERIC_TYPE_INSTANTIATION_NAMESPACE_STRING =
+    "_generic_type_instantiation_namespace";
 
 static const char* const ANNOTATION_GENERATE_PRINT = "@generatePrint";
 static const char* const ANNOTATION_NO_VERIFIER = "@noVerifier";
@@ -105,6 +108,9 @@ enum class ClassFlag {
   kUndefinedLayout = 1 << 11,
 };
 using ClassFlags = base::Flags<ClassFlag>;
+
+enum class StructFlag { kNone = 0, kExport = 1 << 0 };
+using StructFlags = base::Flags<StructFlag>;
 
 }  // namespace torque
 }  // namespace internal

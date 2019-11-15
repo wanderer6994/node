@@ -12,7 +12,6 @@
 #include <string>
 #include <type_traits>
 
-#include "include/v8.h"
 #include "src/base/bits.h"
 #include "src/base/compiler-specific.h"
 #include "src/base/logging.h"
@@ -53,14 +52,12 @@ inline char HexCharOfValue(int value) {
   return value - 10 + 'A';
 }
 
-inline int BoolToInt(bool b) { return b ? 1 : 0; }
-
 // Checks if value is in range [lower_limit, higher_limit] using a single
 // branch.
 template <typename T, typename U>
 inline constexpr bool IsInRange(T value, U lower_limit, U higher_limit) {
-#if V8_CAN_HAVE_DCHECK_IN_CONSTEXPR
-  DCHECK(lower_limit <= higher_limit);
+#if V8_HAS_CXX14_CONSTEXPR
+  DCHECK_LE(lower_limit, higher_limit);
 #endif
   STATIC_ASSERT(sizeof(U) <= sizeof(T));
   using unsigned_T = typename std::make_unsigned<T>::type;
@@ -92,65 +89,6 @@ inline bool ClampToBounds(T index, T* length, T max) {
   return !oob;
 }
 
-// X must be a power of 2.  Returns the number of trailing zeros.
-template <typename T,
-          typename = typename std::enable_if<std::is_integral<T>::value>::type>
-inline int WhichPowerOf2(T x) {
-  DCHECK(base::bits::IsPowerOfTwo(x));
-  int bits = 0;
-#ifdef DEBUG
-  const T original_x = x;
-#endif
-  constexpr int max_bits = sizeof(T) * 8;
-  static_assert(max_bits <= 64, "integral types are not bigger than 64 bits");
-// Avoid shifting by more than the bit width of x to avoid compiler warnings.
-#define CHECK_BIGGER(s)                                      \
-  if (max_bits > s && x >= T{1} << (max_bits > s ? s : 0)) { \
-    bits += s;                                               \
-    x >>= max_bits > s ? s : 0;                              \
-  }
-  CHECK_BIGGER(32)
-  CHECK_BIGGER(16)
-  CHECK_BIGGER(8)
-  CHECK_BIGGER(4)
-#undef CHECK_BIGGER
-  switch (x) {
-    default:
-      UNREACHABLE();
-    case 8:
-      bits++;
-      V8_FALLTHROUGH;
-    case 4:
-      bits++;
-      V8_FALLTHROUGH;
-    case 2:
-      bits++;
-      V8_FALLTHROUGH;
-    case 1:
-      break;
-  }
-  DCHECK_EQ(T{1} << bits, original_x);
-  return bits;
-}
-
-inline int MostSignificantBit(uint32_t x) {
-  static const int msb4[] = {0, 1, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4};
-  int nibble = 0;
-  if (x & 0xffff0000) {
-    nibble += 16;
-    x >>= 16;
-  }
-  if (x & 0xff00) {
-    nibble += 8;
-    x >>= 8;
-  }
-  if (x & 0xf0) {
-    nibble += 4;
-    x >>= 4;
-  }
-  return nibble + msb4[x];
-}
-
 template <typename T>
 static T ArithmeticShiftRight(T x, int shift) {
   DCHECK_LE(0, shift);
@@ -163,26 +101,6 @@ static T ArithmeticShiftRight(T x, int shift) {
   } else {
     return x >> shift;
   }
-}
-
-template <typename T>
-int Compare(const T& a, const T& b) {
-  if (a == b)
-    return 0;
-  else if (a < b)
-    return -1;
-  else
-    return 1;
-}
-
-// Compare function to compare the object pointer value of two
-// handlified objects. The handles are passed as pointers to the
-// handles.
-template <typename T>
-class Handle;  // Forward declaration.
-template <typename T>
-int HandleObjectPointerCompare(const Handle<T>* a, const Handle<T>* b) {
-  return Compare<T*>(*(*a), *(*b));
 }
 
 // Returns the maximum of the two parameters.
@@ -226,13 +144,6 @@ typename std::make_unsigned<T>::type Abs(T a) {
   unsignedT x = static_cast<unsignedT>(a);
   unsignedT y = static_cast<unsignedT>(a >> (sizeof(T) * 8 - 1));
   return (x ^ y) - y;
-}
-
-// Returns the negative absolute value of its argument.
-template <typename T,
-          typename = typename std::enable_if<std::is_signed<T>::value>::type>
-T Nabs(T a) {
-  return a < 0 ? a : -a;
 }
 
 inline double Modulo(double x, double y) {
@@ -342,7 +253,7 @@ class BitField final {
 
   // Returns a type U with the bit field value encoded.
   static constexpr U encode(T value) {
-#if V8_CAN_HAVE_DCHECK_IN_CONSTEXPR
+#if V8_HAS_CXX14_CONSTEXPR
     DCHECK(is_valid(value));
 #endif
     return static_cast<U>(value) << kShift;
@@ -528,45 +439,6 @@ static const int kInt64LowerHalfMemoryOffset = 4;
 static const int kInt64UpperHalfMemoryOffset = 0;
 #endif  // V8_TARGET_LITTLE_ENDIAN
 
-// A static resource holds a static instance that can be reserved in
-// a local scope using an instance of Access.  Attempts to re-reserve
-// the instance will cause an error.
-template <typename T>
-class StaticResource {
- public:
-  StaticResource() : is_reserved_(false) {}
-
- private:
-  template <typename S>
-  friend class Access;
-  T instance_;
-  bool is_reserved_;
-};
-
-// Locally scoped access to a static resource.
-template <typename T>
-class Access {
- public:
-  explicit Access(StaticResource<T>* resource)
-      : resource_(resource), instance_(&resource->instance_) {
-    DCHECK(!resource->is_reserved_);
-    resource->is_reserved_ = true;
-  }
-
-  ~Access() {
-    resource_->is_reserved_ = false;
-    resource_ = nullptr;
-    instance_ = nullptr;
-  }
-
-  T* value() { return instance_; }
-  T* operator->() { return instance_; }
-
- private:
-  StaticResource<T>* resource_;
-  T* instance_;
-};
-
 // A pointer that can only be set once and doesn't allow NULL values.
 template <typename T>
 class SetOncePointer {
@@ -649,41 +521,6 @@ inline int TenToThe(int exponent) {
   for (int i = 1; i < exponent; i++) answer *= 10;
   return answer;
 }
-
-template <typename ElementType, int NumElements>
-class EmbeddedContainer {
- public:
-  EmbeddedContainer() : elems_() {}
-
-  int length() const { return NumElements; }
-  const ElementType& operator[](int i) const {
-    DCHECK(i < length());
-    return elems_[i];
-  }
-  ElementType& operator[](int i) {
-    DCHECK(i < length());
-    return elems_[i];
-  }
-
- private:
-  ElementType elems_[NumElements];
-};
-
-template <typename ElementType>
-class EmbeddedContainer<ElementType, 0> {
- public:
-  int length() const { return 0; }
-  const ElementType& operator[](int i) const {
-    UNREACHABLE();
-    static ElementType t = 0;
-    return t;
-  }
-  ElementType& operator[](int i) {
-    UNREACHABLE();
-    static ElementType t = 0;
-    return t;
-  }
-};
 
 // Helper class for building result strings in a character buffer. The
 // purpose of the class is to use safe operations that checks the

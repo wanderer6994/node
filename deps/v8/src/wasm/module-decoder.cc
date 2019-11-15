@@ -966,7 +966,9 @@ class ModuleDecoderImpl : public Decoder {
         // Function and local names will be decoded when needed.
         if (name_type == NameSectionKindCode::kModule) {
           WireBytesRef name = consume_string(&inner, false, "module name");
-          if (inner.ok() && validate_utf8(&inner, name)) module_->name = name;
+          if (inner.ok() && validate_utf8(&inner, name)) {
+            module_->name = name;
+          }
         } else {
           inner.consume_bytes(name_payload_len, "name subsection payload");
         }
@@ -1638,6 +1640,12 @@ class ModuleDecoderImpl : public Decoder {
                 "Invalid type. Set --experimental-wasm-anyref to use 'AnyRef'");
         }
         return kWasmAnyRef;
+      case kLocalExnRef:
+        if (!enabled_features_.eh) {
+          error(pc_ - 1,
+                "Invalid type. Set --experimental-wasm-eh to use 'ExnRef'");
+        }
+        return kWasmExnRef;
       default:
         break;
     }

@@ -1036,7 +1036,8 @@ bool ExecuteCompilationUnits(
 
   auto publish_results = [&results_to_publish](
                              BackgroundCompileScope* compile_scope) {
-    TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.wasm"), "PublishResults");
+    TRACE_EVENT1(TRACE_DISABLED_BY_DEFAULT("v8.wasm"), "PublishResults",
+                 "num_results", results_to_publish.size());
     if (results_to_publish.empty()) return;
     WasmCodeRefScope code_ref_scope;
     std::vector<WasmCode*> code_vector =
@@ -1125,7 +1126,6 @@ int AddExportWrapperUnits(Isolate* isolate, WasmEngine* wasm_engine,
                           const WasmFeatures& enabled_features) {
 // Disable asynchronous wrapper compilation when builtins are not embedded,
 // otherwise the isolate might be used after tear down to access builtins.
-#ifdef V8_EMBEDDED_BUILTINS
   std::unordered_set<JSToWasmWrapperKey, base::hash<JSToWasmWrapperKey>> keys;
   for (auto exp : native_module->module()->export_table) {
     if (exp.kind != kExternalFunction) continue;
@@ -1140,9 +1140,6 @@ int AddExportWrapperUnits(Isolate* isolate, WasmEngine* wasm_engine,
   }
 
   return static_cast<int>(keys.size());
-#else
-  return 0;
-#endif
 }
 
 // Returns the number of units added.
@@ -1368,21 +1365,20 @@ std::shared_ptr<NativeModule> CompileToNativeModule(
       OwnedVector<uint8_t>::Of(wire_bytes.module_bytes());
 
   // Create a new {NativeModule} first.
+  const bool uses_liftoff = module->origin == kWasmOrigin && FLAG_liftoff;
+  size_t code_size_estimate =
+      wasm::WasmCodeManager::EstimateNativeModuleCodeSize(module.get(),
+                                                          uses_liftoff);
   auto native_module = isolate->wasm_engine()->NewNativeModule(
-      isolate, enabled, std::move(module));
+      isolate, enabled, std::move(module), code_size_estimate);
   native_module->SetWireBytes(std::move(wire_bytes_copy));
 
   CompileNativeModule(isolate, thrower, wasm_module, native_module.get());
   if (thrower->error()) return {};
 
-#ifdef V8_EMBEDDED_BUILTINS
   Impl(native_module->compilation_state())
       ->FinalizeJSToWasmWrappers(isolate, native_module->module(),
                                  export_wrappers_out);
-#else
-  CompileJsToWasmWrappers(isolate, native_module->module(),
-                          export_wrappers_out);
-#endif
 
   // Log the code within the generated module for profiling.
   native_module->LogWasmCodes(isolate);
@@ -1399,6 +1395,7 @@ AsyncCompileJob::AsyncCompileJob(
       api_method_name_(api_method_name),
       enabled_features_(enabled),
       wasm_lazy_compilation_(FLAG_wasm_lazy_compilation),
+      start_time_(base::TimeTicks::Now()),
       bytes_copy_(std::move(bytes_copy)),
       wire_bytes_(bytes_copy_.get(), bytes_copy_.get() + length),
       resolver_(std::move(resolver)) {
@@ -1431,8 +1428,9 @@ class AsyncStreamingProcessor final : public StreamingProcessor {
   bool ProcessSection(SectionCode section_code, Vector<const uint8_t> bytes,
                       uint32_t offset) override;
 
-  bool ProcessCodeSectionHeader(int functions_count, uint32_t offset,
-                                std::shared_ptr<WireBytesStorage>) override;
+  bool ProcessCodeSectionHeader(int num_functions, uint32_t offset,
+                                std::shared_ptr<WireBytesStorage>,
+                                int code_section_length) override;
 
   bool ProcessFunctionBody(Vector<const uint8_t> bytes,
                            uint32_t offset) override;
@@ -1458,7 +1456,6 @@ class AsyncStreamingProcessor final : public StreamingProcessor {
   AsyncCompileJob* job_;
   WasmEngine* wasm_engine_;
   std::unique_ptr<CompilationUnitBuilder> compilation_unit_builder_;
-  base::TimeTicks start_time_;
   int num_functions_ = 0;
 };
 
@@ -1490,7 +1487,7 @@ AsyncCompileJob::~AsyncCompileJob() {
 }
 
 void AsyncCompileJob::CreateNativeModule(
-    std::shared_ptr<const WasmModule> module) {
+    std::shared_ptr<const WasmModule> module, size_t code_size_estimate) {
   // Embedder usage count for declared shared memories.
   if (module->has_shared_memory) {
     isolate_->CountUsage(v8::Isolate::UseCounterFeature::kWasmSharedMemory);
@@ -1507,7 +1504,7 @@ void AsyncCompileJob::CreateNativeModule(
   // Create the module object.
 
   native_module_ = isolate_->wasm_engine()->NewNativeModule(
-      isolate_, enabled_features_, std::move(module));
+      isolate_, enabled_features_, std::move(module), code_size_estimate);
   native_module_->SetWireBytes({std::move(bytes_copy_), wire_bytes_.length()});
 
   if (stream_) stream_->NotifyNativeModuleCreated(native_module_);
@@ -1517,8 +1514,8 @@ void AsyncCompileJob::PrepareRuntimeObjects() {
   // Create heap objects for script and module bytes to be stored in the
   // module object. Asm.js is not compiled asynchronously.
   const WasmModule* module = native_module_->module();
-  Handle<Script> script =
-      CreateWasmScript(isolate_, wire_bytes_, module->source_map_url);
+  Handle<Script> script = CreateWasmScript(
+      isolate_, wire_bytes_, module->source_map_url, module->name);
 
   Handle<WasmModuleObject> module_object =
       WasmModuleObject::New(isolate_, native_module_, script);
@@ -1535,6 +1532,15 @@ void AsyncCompileJob::FinishCompile() {
   if (!is_after_deserialization) {
     PrepareRuntimeObjects();
   }
+
+  // Measure duration of baseline compilation or deserialization from cache.
+  if (base::TimeTicks::IsHighResolution()) {
+    base::TimeDelta duration = base::TimeTicks::Now() - start_time_;
+    int duration_usecs = static_cast<int>(duration.InMicroseconds());
+    isolate_->counters()->wasm_streaming_finish_wasm_module_time()->AddSample(
+        duration_usecs);
+  }
+
   DCHECK(!isolate_->context().is_null());
   // Finish the wasm script now and make it public to the debugger.
   Handle<Script> script(module_object_->script(), isolate_);
@@ -1545,24 +1551,20 @@ void AsyncCompileJob::FinishCompile() {
         AllocationType::kOld);
     script->set_source_mapping_url(*src_map_str.ToHandleChecked());
   }
-  isolate_->debug()->OnAfterCompile(script);
+  {
+    TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.wasm"), "Debug::OnAfterCompile");
+    isolate_->debug()->OnAfterCompile(script);
+  }
 
   auto compilation_state =
       Impl(module_object_->native_module()->compilation_state());
   // TODO(bbudge) Allow deserialization without wrapper compilation, so we can
   // just compile wrappers here.
   if (!is_after_deserialization) {
-#ifdef V8_EMBEDDED_BUILTINS
     Handle<FixedArray> export_wrappers;
     compilation_state->FinalizeJSToWasmWrappers(
         isolate_, module_object_->module(), &export_wrappers);
     module_object_->set_export_wrappers(*export_wrappers);
-#else
-    Handle<FixedArray> export_wrappers;
-    CompileJsToWasmWrappers(isolate_, module_object_->module(),
-                            &export_wrappers);
-    module_object_->set_export_wrappers(*export_wrappers);
-#endif
   }
   // We can only update the feature counts once the entire compile is done.
   compilation_state->PublishDetectedFeatures(isolate_);
@@ -1594,6 +1596,8 @@ void AsyncCompileJob::AsyncCompileFailed() {
 }
 
 void AsyncCompileJob::AsyncCompileSucceeded(Handle<WasmModuleObject> result) {
+  TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.wasm"),
+               "CompilationResultResolver::OnCompilationSucceeded");
   resolver_->OnCompilationSucceeded(result);
 }
 
@@ -1820,7 +1824,13 @@ class AsyncCompileJob::DecodeModule : public AsyncCompileJob::CompileStep {
       job->DoSync<DecodeFail>(std::move(result).error());
     } else {
       // Decode passed.
-      job->DoSync<PrepareAndStartCompile>(std::move(result).value(), true);
+      std::shared_ptr<WasmModule> module = std::move(result).value();
+      const bool kUsesLiftoff = false;
+      size_t code_size_estimate =
+          wasm::WasmCodeManager::EstimateNativeModuleCodeSize(module.get(),
+                                                              kUsesLiftoff);
+      job->DoSync<PrepareAndStartCompile>(std::move(module), true,
+                                          code_size_estimate);
     }
   }
 
@@ -1851,12 +1861,15 @@ class AsyncCompileJob::DecodeFail : public CompileStep {
 class AsyncCompileJob::PrepareAndStartCompile : public CompileStep {
  public:
   PrepareAndStartCompile(std::shared_ptr<const WasmModule> module,
-                         bool start_compilation)
-      : module_(std::move(module)), start_compilation_(start_compilation) {}
+                         bool start_compilation, size_t code_size_estimate)
+      : module_(std::move(module)),
+        start_compilation_(start_compilation),
+        code_size_estimate_(code_size_estimate) {}
 
  private:
-  std::shared_ptr<const WasmModule> module_;
-  bool start_compilation_;
+  const std::shared_ptr<const WasmModule> module_;
+  const bool start_compilation_;
+  const size_t code_size_estimate_;
 
   void RunInForeground(AsyncCompileJob* job) override {
     TRACE_COMPILE("(2) Prepare and start compile...\n");
@@ -1865,7 +1878,7 @@ class AsyncCompileJob::PrepareAndStartCompile : public CompileStep {
     // is done.
     job->background_task_manager_.CancelAndWait();
 
-    job->CreateNativeModule(module_);
+    job->CreateNativeModule(module_, code_size_estimate_);
 
     CompilationStateImpl* compilation_state =
         Impl(job->native_module_->compilation_state());
@@ -1956,8 +1969,7 @@ AsyncStreamingProcessor::AsyncStreamingProcessor(AsyncCompileJob* job)
     : decoder_(job->enabled_features_),
       job_(job),
       wasm_engine_(job_->isolate_->wasm_engine()),
-      compilation_unit_builder_(nullptr),
-      start_time_(base::TimeTicks::Now()) {}
+      compilation_unit_builder_(nullptr) {}
 
 void AsyncStreamingProcessor::FinishAsyncCompileJobWithError(
     const WasmError& error) {
@@ -2031,19 +2043,28 @@ bool AsyncStreamingProcessor::ProcessSection(SectionCode section_code,
 
 // Start the code section.
 bool AsyncStreamingProcessor::ProcessCodeSectionHeader(
-    int functions_count, uint32_t offset,
-    std::shared_ptr<WireBytesStorage> wire_bytes_storage) {
+    int num_functions, uint32_t offset,
+    std::shared_ptr<WireBytesStorage> wire_bytes_storage,
+    int code_section_length) {
   TRACE_STREAMING("Start the code section with %d functions...\n",
-                  functions_count);
-  if (!decoder_.CheckFunctionsCount(static_cast<uint32_t>(functions_count),
+                  num_functions);
+  if (!decoder_.CheckFunctionsCount(static_cast<uint32_t>(num_functions),
                                     offset)) {
     FinishAsyncCompileJobWithError(decoder_.FinishDecoding(false).error());
     return false;
   }
   // Execute the PrepareAndStartCompile step immediately and not in a separate
   // task.
+  int num_imported_functions =
+      static_cast<int>(decoder_.module()->num_imported_functions);
+  DCHECK_EQ(kWasmOrigin, decoder_.module()->origin);
+  const bool uses_liftoff = FLAG_liftoff;
+  size_t code_size_estimate =
+      wasm::WasmCodeManager::EstimateNativeModuleCodeSize(
+          num_functions, num_imported_functions, code_section_length,
+          uses_liftoff);
   job_->DoImmediately<AsyncCompileJob::PrepareAndStartCompile>(
-      decoder_.shared_module(), false);
+      decoder_.shared_module(), false, code_size_estimate);
   auto* compilation_state = Impl(job_->native_module_->compilation_state());
   compilation_state->SetWireBytesStorage(std::move(wire_bytes_storage));
   DCHECK_EQ(job_->native_module_->module()->origin, kWasmOrigin);
@@ -2152,7 +2173,8 @@ void AsyncStreamingProcessor::OnFinishedStream(OwnedVector<uint8_t> bytes) {
   if (job_->native_module_ == nullptr) {
     // We are processing a WebAssembly module without code section. Create the
     // runtime objects now (would otherwise happen in {PrepareAndStartCompile}).
-    job_->CreateNativeModule(std::move(result).value());
+    constexpr size_t kCodeSizeEstimate = 0;
+    job_->CreateNativeModule(std::move(result).value(), kCodeSizeEstimate);
     DCHECK(needs_finish);
   }
   job_->wire_bytes_ = ModuleWireBytes(bytes.as_vector());
@@ -2186,12 +2208,6 @@ bool AsyncStreamingProcessor::Deserialize(Vector<const uint8_t> module_bytes,
 
   MaybeHandle<WasmModuleObject> result =
       DeserializeNativeModule(job_->isolate_, module_bytes, wire_bytes);
-  if (base::TimeTicks::IsHighResolution()) {
-    base::TimeDelta duration = base::TimeTicks::Now() - start_time_;
-    auto* histogram = job_->isolate_->counters()
-                          ->wasm_streaming_deserialize_wasm_module_time();
-    histogram->AddSample(static_cast<int>(duration.InMicroseconds()));
-  }
 
   if (result.is_null()) return false;
 
@@ -2345,8 +2361,8 @@ void CompilationStateImpl::FinalizeJSToWasmWrappers(
   // TODO(6792): Wrappers below are allocated with {Factory::NewCode}. As an
   // optimization we keep the code space unlocked to avoid repeated unlocking
   // because many such wrapper are allocated in sequence below.
-  TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.wasm"),
-               "FinalizeJSToWasmWrappers");
+  TRACE_EVENT1(TRACE_DISABLED_BY_DEFAULT("v8.wasm"), "FinalizeJSToWasmWrappers",
+               "num_wrappers", js_to_wasm_wrapper_units_.size());
   CodeSpaceMemoryModificationScope modification_scope(isolate->heap());
   for (auto& unit : js_to_wasm_wrapper_units_) {
     Handle<Code> code = unit->Finalize(isolate);
@@ -2364,7 +2380,8 @@ CompilationStateImpl::GetNextCompilationUnit(
 }
 
 void CompilationStateImpl::OnFinishedUnits(Vector<WasmCode*> code_vector) {
-  TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.wasm"), "OnFinishedUnits");
+  TRACE_EVENT1(TRACE_DISABLED_BY_DEFAULT("v8.wasm"), "OnFinishedUnits",
+               "num_units", code_vector.size());
 
   base::MutexGuard guard(&callbacks_mutex_);
 
@@ -2386,12 +2403,12 @@ void CompilationStateImpl::OnFinishedUnits(Vector<WasmCode*> code_vector) {
   DCHECK_EQ(compilation_progress_.size(),
             native_module_->module()->num_declared_functions);
 
+  bool completes_baseline_compilation = false;
+  bool completes_top_tier_compilation = false;
+
   for (WasmCode* code : code_vector) {
     DCHECK_NOT_NULL(code);
     DCHECK_LT(code->index(), native_module_->num_functions());
-
-    bool completes_baseline_compilation = false;
-    bool completes_top_tier_compilation = false;
 
     if (code->index() < native_module_->num_imported_functions()) {
       // Import wrapper.
@@ -2443,10 +2460,10 @@ void CompilationStateImpl::OnFinishedUnits(Vector<WasmCode*> code_vector) {
       }
       DCHECK_LE(0, outstanding_baseline_units_);
     }
-
-    TriggerCallbacks(completes_baseline_compilation,
-                     completes_top_tier_compilation);
   }
+
+  TriggerCallbacks(completes_baseline_compilation,
+                   completes_top_tier_compilation);
 }
 
 void CompilationStateImpl::OnFinishedJSToWasmWrapperUnits(int num) {
@@ -2680,7 +2697,8 @@ WasmCode* CompileImportWrapper(
 
 Handle<Script> CreateWasmScript(Isolate* isolate,
                                 const ModuleWireBytes& wire_bytes,
-                                const std::string& source_map_url) {
+                                const std::string& source_map_url,
+                                WireBytesRef name) {
   Handle<Script> script =
       isolate->factory()->NewScript(isolate->factory()->empty_string());
   script->set_context_data(isolate->native_context()->debug_context_id());
@@ -2696,14 +2714,34 @@ Handle<Script> CreateWasmScript(Isolate* isolate,
   Handle<String> url_prefix =
       isolate->factory()->InternalizeString(StaticCharVector("wasm://wasm/"));
 
-  int name_chars = SNPrintF(ArrayVector(buffer), "wasm-%08x", hash);
-  DCHECK(name_chars >= 0 && name_chars < kBufferSize);
-  Handle<String> name_str =
-      isolate->factory()
-          ->NewStringFromOneByte(
-              VectorOf(reinterpret_cast<uint8_t*>(buffer), name_chars),
-              AllocationType::kOld)
-          .ToHandleChecked();
+  // Script name is "<module_name>-hash" if name is available and "hash"
+  // otherwise.
+  Handle<String> name_str;
+  if (name.is_set()) {
+    int name_chars = SNPrintF(ArrayVector(buffer), "-%08x", hash);
+    DCHECK(name_chars >= 0 && name_chars < kBufferSize);
+    Handle<String> name_hash =
+        isolate->factory()
+            ->NewStringFromOneByte(
+                VectorOf(reinterpret_cast<uint8_t*>(buffer), name_chars),
+                AllocationType::kOld)
+            .ToHandleChecked();
+    Handle<String> module_name =
+        WasmModuleObject::ExtractUtf8StringFromModuleBytes(
+            isolate, wire_bytes.module_bytes(), name)
+            .ToHandleChecked();
+    name_str = isolate->factory()
+                   ->NewConsString(module_name, name_hash)
+                   .ToHandleChecked();
+  } else {
+    int name_chars = SNPrintF(ArrayVector(buffer), "%08x", hash);
+    DCHECK(name_chars >= 0 && name_chars < kBufferSize);
+    name_str = isolate->factory()
+                   ->NewStringFromOneByte(
+                       VectorOf(reinterpret_cast<uint8_t*>(buffer), name_chars),
+                       AllocationType::kOld)
+                   .ToHandleChecked();
+  }
   script->set_name(*name_str);
   MaybeHandle<String> url_str =
       isolate->factory()->NewConsString(url_prefix, name_str);

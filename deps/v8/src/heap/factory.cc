@@ -4,12 +4,18 @@
 
 #include "src/heap/factory.h"
 
+#include <algorithm>  // For copy
+#include <memory>     // For shared_ptr<>
+#include <string>
+#include <utility>  // For move
+
 #include "src/ast/ast-source-ranges.h"
 #include "src/ast/ast.h"
 #include "src/base/bits.h"
 #include "src/builtins/accessors.h"
 #include "src/builtins/constants-table-builder.h"
 #include "src/codegen/compiler.h"
+#include "src/common/globals.h"
 #include "src/execution/isolate-inl.h"
 #include "src/execution/protectors-inl.h"
 #include "src/heap/heap-inl.h"
@@ -50,6 +56,7 @@
 #include "src/objects/struct-inl.h"
 #include "src/objects/template-objects-inl.h"
 #include "src/objects/transitions-inl.h"
+#include "src/roots/roots.h"
 #include "src/strings/unicode-inl.h"
 
 namespace v8 {
@@ -117,12 +124,14 @@ MaybeHandle<Code> Factory::CodeBuilder::BuildInternal(
 
     CodePageCollectionMemoryModificationScope code_allocation(heap);
     HeapObject result;
+    AllocationType allocation_type =
+        is_executable_ ? AllocationType::kCode : AllocationType::kReadOnly;
     if (retry_allocation_or_fail) {
       result = heap->AllocateRawWith<Heap::kRetryOrFail>(object_size,
-                                                         AllocationType::kCode);
+                                                         allocation_type);
     } else {
       result = heap->AllocateRawWith<Heap::kLightRetry>(object_size,
-                                                        AllocationType::kCode);
+                                                        allocation_type);
       // Return an empty handle if we cannot allocate the code object.
       if (result.is_null()) return MaybeHandle<Code>();
     }
@@ -137,10 +146,12 @@ MaybeHandle<Code> Factory::CodeBuilder::BuildInternal(
 
     result.set_map_after_allocation(*factory->code_map(), SKIP_WRITE_BARRIER);
     code = handle(Code::cast(result), isolate_);
-    DCHECK(IsAligned(code->address(), kCodeAlignment));
-    DCHECK_IMPLIES(
-        !heap->memory_allocator()->code_range().is_empty(),
-        heap->memory_allocator()->code_range().contains(code->address()));
+    if (is_executable_) {
+      DCHECK(IsAligned(code->address(), kCodeAlignment));
+      DCHECK_IMPLIES(
+          !heap->memory_allocator()->code_range().is_empty(),
+          heap->memory_allocator()->code_range().contains(code->address()));
+    }
 
     constexpr bool kIsNotOffHeapTrampoline = false;
     const bool has_unwinding_info = code_desc_.unwinding_info != nullptr;
@@ -165,10 +176,9 @@ MaybeHandle<Code> Factory::CodeBuilder::BuildInternal(
       DCHECK(self_reference->IsOddball());
       DCHECK(Oddball::cast(*self_reference).kind() ==
              Oddball::kSelfReferenceMarker);
-      if (FLAG_embedded_builtins) {
-        auto builder = isolate_->builtins_constants_table_builder();
-        if (builder != nullptr)
-          builder->PatchSelfReference(self_reference, code);
+      if (isolate_->IsGeneratingEmbeddedBuiltins()) {
+        isolate_->builtins_constants_table_builder()->PatchSelfReference(
+            self_reference, code);
       }
       *(self_reference.location()) = code->ptr();
     }
@@ -1348,22 +1358,6 @@ MaybeHandle<String> Factory::NewExternalStringFromTwoByte(
   return external_string;
 }
 
-Handle<ExternalOneByteString> Factory::NewNativeSourceString(
-    const ExternalOneByteString::Resource* resource) {
-  size_t length = resource->length();
-  DCHECK_LE(length, static_cast<size_t>(String::kMaxLength));
-
-  Handle<Map> map = native_source_string_map();
-  Handle<ExternalOneByteString> external_string(
-      ExternalOneByteString::cast(New(map, AllocationType::kOld)), isolate());
-  external_string->set_length(static_cast<int>(length));
-  external_string->set_hash_field(String::kEmptyHashField);
-  external_string->SetResource(isolate(), resource);
-  isolate()->heap()->RegisterExternalString(*external_string);
-
-  return external_string;
-}
-
 Handle<JSStringIterator> Factory::NewJSStringIterator(Handle<String> string) {
   Handle<Map> map(isolate()->native_context()->initial_string_iterator_map(),
                   isolate());
@@ -1390,7 +1384,7 @@ Handle<Symbol> Factory::NewSymbol(AllocationType allocation) {
   Handle<Symbol> symbol(Symbol::cast(result), isolate());
   symbol->set_hash_field(Name::kIsNotArrayIndexMask |
                          (hash << Name::kHashShift));
-  symbol->set_name(*undefined_value());
+  symbol->set_description(*undefined_value());
   symbol->set_flags(0);
   DCHECK(!symbol->is_private());
   return symbol;
@@ -1406,24 +1400,24 @@ Handle<Symbol> Factory::NewPrivateSymbol(AllocationType allocation) {
 Handle<Symbol> Factory::NewPrivateNameSymbol(Handle<String> name) {
   Handle<Symbol> symbol = NewSymbol();
   symbol->set_is_private_name();
-  symbol->set_name(*name);
+  symbol->set_description(*name);
   return symbol;
 }
 
-Handle<Context> Factory::NewContext(RootIndex map_root_index, int size,
+Handle<Context> Factory::NewContext(Handle<Map> map, int size,
                                     int variadic_part_length,
                                     AllocationType allocation) {
-  DCHECK(RootsTable::IsImmortalImmovable(map_root_index));
   DCHECK_LE(Context::kTodoHeaderSize, size);
   DCHECK(IsAligned(size, kTaggedSize));
   DCHECK_LE(Context::MIN_CONTEXT_SLOTS, variadic_part_length);
   DCHECK_LE(Context::SizeFor(variadic_part_length), size);
 
-  Map map = Map::cast(isolate()->root(map_root_index));
-  HeapObject result = AllocateRawWithImmortalMap(size, allocation, map);
+  HeapObject result =
+      isolate()->heap()->AllocateRawWith<Heap::kRetryOrFail>(size, allocation);
+  result.set_map_after_allocation(*map);
   Handle<Context> context(Context::cast(result), isolate());
-  context->initialize_length_and_extension_bit(variadic_part_length);
-  DCHECK_EQ(context->SizeFromMap(map), size);
+  context->set_length(variadic_part_length);
+  DCHECK_EQ(context->SizeFromMap(*map), size);
   if (size > Context::kTodoHeaderSize) {
     ObjectSlot start = context->RawField(Context::kTodoHeaderSize);
     ObjectSlot end = context->RawField(size);
@@ -1434,13 +1428,16 @@ Handle<Context> Factory::NewContext(RootIndex map_root_index, int size,
 }
 
 Handle<NativeContext> Factory::NewNativeContext() {
+  Handle<Map> map = NewMap(NATIVE_CONTEXT_TYPE, kVariableSizeSentinel);
   Handle<NativeContext> context = Handle<NativeContext>::cast(
-      NewContext(RootIndex::kNativeContextMap, NativeContext::kSize,
-                 NativeContext::NATIVE_CONTEXT_SLOTS, AllocationType::kOld));
-  context->set_scope_info(ReadOnlyRoots(isolate()).empty_scope_info());
+      NewContext(map, NativeContext::kSize, NativeContext::NATIVE_CONTEXT_SLOTS,
+                 AllocationType::kOld));
+  context->set_native_context_map(*map);
+  map->set_native_context(*context);
+  context->set_scope_info(ReadOnlyRoots(isolate()).native_scope_info());
   context->set_previous(Context::unchecked_cast(Smi::zero()));
-  context->set_extension(*the_hole_value());
-  context->set_native_context(*context);
+  context->set_extension(*undefined_value());
+  context->SetDetachedWindowReason(v8::Context::kWindowNotDetached);
   context->set_errors_thrown(Smi::zero());
   context->set_math_random_index(Smi::zero());
   context->set_serialized_objects(*empty_fixed_array());
@@ -1454,12 +1451,10 @@ Handle<Context> Factory::NewScriptContext(Handle<NativeContext> outer,
   DCHECK_EQ(scope_info->scope_type(), SCRIPT_SCOPE);
   int variadic_part_length = scope_info->ContextLength();
   Handle<Context> context = NewContext(
-      RootIndex::kScriptContextMap, Context::SizeFor(variadic_part_length),
+      isolate()->script_context_map(), Context::SizeFor(variadic_part_length),
       variadic_part_length, AllocationType::kOld);
   context->set_scope_info(*scope_info);
   context->set_previous(*outer);
-  context->set_extension(*the_hole_value());
-  context->set_native_context(*outer);
   DCHECK(context->IsScriptContext());
   return context;
 }
@@ -1478,37 +1473,34 @@ Handle<Context> Factory::NewModuleContext(Handle<SourceTextModule> module,
   DCHECK_EQ(scope_info->scope_type(), MODULE_SCOPE);
   int variadic_part_length = scope_info->ContextLength();
   Handle<Context> context = NewContext(
-      RootIndex::kModuleContextMap, Context::SizeFor(variadic_part_length),
+      isolate()->module_context_map(), Context::SizeFor(variadic_part_length),
       variadic_part_length, AllocationType::kOld);
   context->set_scope_info(*scope_info);
   context->set_previous(*outer);
   context->set_extension(*module);
-  context->set_native_context(*outer);
   DCHECK(context->IsModuleContext());
   return context;
 }
 
 Handle<Context> Factory::NewFunctionContext(Handle<Context> outer,
                                             Handle<ScopeInfo> scope_info) {
-  RootIndex mapRootIndex;
+  Handle<Map> map;
   switch (scope_info->scope_type()) {
     case EVAL_SCOPE:
-      mapRootIndex = RootIndex::kEvalContextMap;
+      map = isolate()->eval_context_map();
       break;
     case FUNCTION_SCOPE:
-      mapRootIndex = RootIndex::kFunctionContextMap;
+      map = isolate()->function_context_map();
       break;
     default:
       UNREACHABLE();
   }
   int variadic_part_length = scope_info->ContextLength();
   Handle<Context> context =
-      NewContext(mapRootIndex, Context::SizeFor(variadic_part_length),
+      NewContext(map, Context::SizeFor(variadic_part_length),
                  variadic_part_length, AllocationType::kYoung);
   context->set_scope_info(*scope_info);
   context->set_previous(*outer);
-  context->set_extension(*the_hole_value());
-  context->set_native_context(outer->native_context());
   return context;
 }
 
@@ -1520,12 +1512,10 @@ Handle<Context> Factory::NewCatchContext(Handle<Context> previous,
   // TODO(ishell): Take the details from CatchContext class.
   int variadic_part_length = Context::MIN_CONTEXT_SLOTS + 1;
   Handle<Context> context = NewContext(
-      RootIndex::kCatchContextMap, Context::SizeFor(variadic_part_length),
+      isolate()->catch_context_map(), Context::SizeFor(variadic_part_length),
       variadic_part_length, AllocationType::kYoung);
   context->set_scope_info(*scope_info);
   context->set_previous(*previous);
-  context->set_extension(*the_hole_value());
-  context->set_native_context(previous->native_context());
   context->set(Context::THROWN_OBJECT_INDEX, *thrown_object);
   return context;
 }
@@ -1535,19 +1525,19 @@ Handle<Context> Factory::NewDebugEvaluateContext(Handle<Context> previous,
                                                  Handle<JSReceiver> extension,
                                                  Handle<Context> wrapped,
                                                  Handle<StringSet> blacklist) {
-  STATIC_ASSERT(Context::BLACK_LIST_INDEX == Context::MIN_CONTEXT_SLOTS + 1);
+  STATIC_ASSERT(Context::BLACK_LIST_INDEX ==
+                Context::MIN_CONTEXT_EXTENDED_SLOTS + 1);
   DCHECK(scope_info->IsDebugEvaluateScope());
   Handle<HeapObject> ext = extension.is_null()
-                               ? Handle<HeapObject>::cast(the_hole_value())
+                               ? Handle<HeapObject>::cast(undefined_value())
                                : Handle<HeapObject>::cast(extension);
   // TODO(ishell): Take the details from DebugEvaluateContextContext class.
-  int variadic_part_length = Context::MIN_CONTEXT_SLOTS + 2;
-  Handle<Context> c = NewContext(RootIndex::kDebugEvaluateContextMap,
+  int variadic_part_length = Context::MIN_CONTEXT_EXTENDED_SLOTS + 2;
+  Handle<Context> c = NewContext(isolate()->debug_evaluate_context_map(),
                                  Context::SizeFor(variadic_part_length),
                                  variadic_part_length, AllocationType::kYoung);
   c->set_scope_info(*scope_info);
   c->set_previous(*previous);
-  c->set_native_context(previous->native_context());
   c->set_extension(*ext);
   if (!wrapped.is_null()) c->set(Context::WRAPPED_CONTEXT_INDEX, *wrapped);
   if (!blacklist.is_null()) c->set(Context::BLACK_LIST_INDEX, *blacklist);
@@ -1559,14 +1549,13 @@ Handle<Context> Factory::NewWithContext(Handle<Context> previous,
                                         Handle<JSReceiver> extension) {
   DCHECK_EQ(scope_info->scope_type(), WITH_SCOPE);
   // TODO(ishell): Take the details from WithContext class.
-  int variadic_part_length = Context::MIN_CONTEXT_SLOTS;
+  int variadic_part_length = Context::MIN_CONTEXT_EXTENDED_SLOTS;
   Handle<Context> context = NewContext(
-      RootIndex::kWithContextMap, Context::SizeFor(variadic_part_length),
+      isolate()->with_context_map(), Context::SizeFor(variadic_part_length),
       variadic_part_length, AllocationType::kYoung);
   context->set_scope_info(*scope_info);
   context->set_previous(*previous);
   context->set_extension(*extension);
-  context->set_native_context(previous->native_context());
   return context;
 }
 
@@ -1576,12 +1565,10 @@ Handle<Context> Factory::NewBlockContext(Handle<Context> previous,
                  scope_info->scope_type() == CLASS_SCOPE);
   int variadic_part_length = scope_info->ContextLength();
   Handle<Context> context = NewContext(
-      RootIndex::kBlockContextMap, Context::SizeFor(variadic_part_length),
+      isolate()->block_context_map(), Context::SizeFor(variadic_part_length),
       variadic_part_length, AllocationType::kYoung);
   context->set_scope_info(*scope_info);
   context->set_previous(*previous);
-  context->set_extension(*the_hole_value());
-  context->set_native_context(previous->native_context());
   return context;
 }
 
@@ -1589,12 +1576,10 @@ Handle<Context> Factory::NewBuiltinContext(Handle<NativeContext> native_context,
                                            int variadic_part_length) {
   DCHECK_LE(Context::MIN_CONTEXT_SLOTS, variadic_part_length);
   Handle<Context> context = NewContext(
-      RootIndex::kFunctionContextMap, Context::SizeFor(variadic_part_length),
+      isolate()->function_context_map(), Context::SizeFor(variadic_part_length),
       variadic_part_length, AllocationType::kYoung);
   context->set_scope_info(ReadOnlyRoots(isolate()).empty_scope_info());
   context->set_previous(*native_context);
-  context->set_extension(*the_hole_value());
-  context->set_native_context(*native_context);
   return context;
 }
 
@@ -1662,9 +1647,6 @@ Handle<Script> Factory::NewScriptWithId(Handle<String> source, int script_id) {
                                     MaybeObjectHandle::Weak(script));
   heap->set_script_list(*scripts);
   LOG(isolate(), ScriptEvent(Logger::ScriptEventType::kCreate, script_id));
-  TRACE_EVENT_OBJECT_CREATED_WITH_ID(
-      TRACE_DISABLED_BY_DEFAULT("v8.compile"), "Script",
-      TRACE_ID_WITH_SCOPE(Script::kTraceScope, script_id));
   return script;
 }
 
@@ -2620,9 +2602,12 @@ Handle<Code> Factory::NewOffHeapTrampolineFor(Handle<Code> code,
   CHECK_NE(0, isolate()->embedded_blob_size());
   CHECK(Builtins::IsIsolateIndependentBuiltin(*code));
 
+  bool generate_jump_to_instruction_stream =
+      Builtins::CodeObjectIsExecutable(code->builtin_index());
   Handle<Code> result = Builtins::GenerateOffHeapTrampolineFor(
       isolate(), off_heap_entry,
-      code->code_data_container().kind_specific_flags());
+      code->code_data_container().kind_specific_flags(),
+      generate_jump_to_instruction_stream);
   // The CodeDataContainer should not be modified beyond this point since it's
   // now possibly canonicalized.
 
@@ -2648,7 +2633,9 @@ Handle<Code> Factory::NewOffHeapTrampolineFor(Handle<Code> code,
     // canonical one stored in the roots to avoid duplicating it for every
     // single builtin.
     ByteArray canonical_reloc_info =
-        ReadOnlyRoots(isolate()).off_heap_trampoline_relocation_info();
+        generate_jump_to_instruction_stream
+            ? ReadOnlyRoots(isolate()).off_heap_trampoline_relocation_info()
+            : ReadOnlyRoots(isolate()).empty_byte_array();
 #ifdef DEBUG
     // Verify that the contents are the same.
     ByteArray reloc_info = result->relocation_info();
@@ -2770,7 +2757,7 @@ Handle<JSGlobalObject> Factory::NewJSGlobalObject(
   // The global object might be created from an object template with accessors.
   // Fill these accessors into the dictionary.
   Handle<DescriptorArray> descs(map->instance_descriptors(), isolate());
-  for (InternalIndex i : InternalIndex::Range(map->NumberOfOwnDescriptors())) {
+  for (InternalIndex i : map->IterateOwnDescriptors()) {
     PropertyDetails details = descs->GetDetails(i);
     // Only accessors are expected.
     DCHECK_EQ(kAccessor, details.kind());
@@ -3390,15 +3377,6 @@ Handle<SharedFunctionInfo> Factory::NewSharedFunctionInfoForLiteral(
   SharedFunctionInfo::InitFromFunctionLiteral(shared, literal, is_toplevel);
   SharedFunctionInfo::SetScript(shared, script, literal->function_literal_id(),
                                 false);
-  TRACE_EVENT_OBJECT_CREATED_WITH_ID(
-      TRACE_DISABLED_BY_DEFAULT("v8.compile"), "SharedFunctionInfo",
-      TRACE_ID_WITH_SCOPE(SharedFunctionInfo::kTraceScope,
-                          shared->TraceID(literal)));
-  TRACE_EVENT_OBJECT_SNAPSHOT_WITH_ID(
-      TRACE_DISABLED_BY_DEFAULT("v8.compile"), "SharedFunctionInfo",
-      TRACE_ID_WITH_SCOPE(SharedFunctionInfo::kTraceScope,
-                          shared->TraceID(literal)),
-      shared->ToTracedValue(literal));
   return shared;
 }
 
@@ -3464,70 +3442,59 @@ Handle<SharedFunctionInfo> Factory::NewSharedFunctionInfoForBuiltin(
 Handle<SharedFunctionInfo> Factory::NewSharedFunctionInfo(
     MaybeHandle<String> maybe_name, MaybeHandle<HeapObject> maybe_function_data,
     int maybe_builtin_index, FunctionKind kind) {
+  Handle<SharedFunctionInfo> shared = NewSharedFunctionInfo();
+
   // Function names are assumed to be flat elsewhere. Must flatten before
   // allocating SharedFunctionInfo to avoid GC seeing the uninitialized SFI.
   Handle<String> shared_name;
   bool has_shared_name = maybe_name.ToHandle(&shared_name);
   if (has_shared_name) {
     shared_name = String::Flatten(isolate(), shared_name, AllocationType::kOld);
+    shared->set_name_or_scope_info(*shared_name);
+  } else {
+    DCHECK_EQ(shared->name_or_scope_info(),
+              SharedFunctionInfo::kNoSharedNameSentinel);
   }
 
-  Handle<Map> map = shared_function_info_map();
-  Handle<SharedFunctionInfo> share(
-      SharedFunctionInfo::cast(New(map, AllocationType::kOld)), isolate());
-  {
-    DisallowHeapAllocation no_allocation;
-
-    // Set pointer fields.
-    share->set_name_or_scope_info(
-        has_shared_name ? Object::cast(*shared_name)
-                        : SharedFunctionInfo::kNoSharedNameSentinel);
-    Handle<HeapObject> function_data;
-    if (maybe_function_data.ToHandle(&function_data)) {
-      // If we pass function_data then we shouldn't pass a builtin index, and
-      // the function_data should not be code with a builtin.
-      DCHECK(!Builtins::IsBuiltinId(maybe_builtin_index));
-      DCHECK_IMPLIES(function_data->IsCode(),
-                     !Code::cast(*function_data).is_builtin());
-      share->set_function_data(*function_data);
-    } else if (Builtins::IsBuiltinId(maybe_builtin_index)) {
-      share->set_builtin_id(maybe_builtin_index);
-    } else {
-      share->set_builtin_id(Builtins::kIllegal);
-    }
-    // Generally functions won't have feedback, unless they have been created
-    // from a FunctionLiteral. Those can just reset this field to keep the
-    // SharedFunctionInfo in a consistent state.
-    if (maybe_builtin_index == Builtins::kCompileLazy) {
-      share->set_raw_outer_scope_info_or_feedback_metadata(*the_hole_value(),
-                                                           SKIP_WRITE_BARRIER);
-    } else {
-      share->set_raw_outer_scope_info_or_feedback_metadata(
-          *empty_feedback_metadata(), SKIP_WRITE_BARRIER);
-    }
-    share->set_script_or_debug_info(*undefined_value(), SKIP_WRITE_BARRIER);
-    share->set_function_literal_id(kFunctionLiteralIdInvalid);
-#if V8_SFI_HAS_UNIQUE_ID
-    share->set_unique_id(isolate()->GetNextUniqueSharedFunctionInfoId());
-#endif
-
-    // Set integer fields (smi or int, depending on the architecture).
-    share->set_length(0);
-    share->set_internal_formal_parameter_count(0);
-    share->set_expected_nof_properties(0);
-    share->set_raw_function_token_offset(0);
-    // All flags default to false or 0.
-    share->set_flags(0);
-    share->CalculateConstructAsBuiltin();
-    share->set_kind(kind);
-
-    share->clear_padding();
+  Handle<HeapObject> function_data;
+  if (maybe_function_data.ToHandle(&function_data)) {
+    // If we pass function_data then we shouldn't pass a builtin index, and
+    // the function_data should not be code with a builtin.
+    DCHECK(!Builtins::IsBuiltinId(maybe_builtin_index));
+    DCHECK_IMPLIES(function_data->IsCode(),
+                   !Code::cast(*function_data).is_builtin());
+    shared->set_function_data(*function_data);
+  } else if (Builtins::IsBuiltinId(maybe_builtin_index)) {
+    shared->set_builtin_id(maybe_builtin_index);
+  } else {
+    shared->set_builtin_id(Builtins::kIllegal);
   }
+
+  shared->CalculateConstructAsBuiltin();
+  shared->set_kind(kind);
 
 #ifdef VERIFY_HEAP
-  share->SharedFunctionInfoVerify(isolate());
-#endif
-  return share;
+  shared->SharedFunctionInfoVerify(isolate());
+#endif  // VERIFY_HEAP
+  return shared;
+}
+
+Handle<SharedFunctionInfo> Factory::NewSharedFunctionInfo() {
+  Handle<Map> map = shared_function_info_map();
+
+  Handle<SharedFunctionInfo> shared(
+      SharedFunctionInfo::cast(New(map, AllocationType::kOld)), isolate());
+  int unique_id = -1;
+#if V8_SFI_HAS_UNIQUE_ID
+  unique_id = isolate()->GetNextUniqueSharedFunctionInfoId();
+#endif  // V8_SFI_HAS_UNIQUE_ID
+
+  shared->Init(ReadOnlyRoots(isolate()), unique_id);
+
+#ifdef VERIFY_HEAP
+  shared->SharedFunctionInfoVerify(isolate());
+#endif  // VERIFY_HEAP
+  return shared;
 }
 
 namespace {
@@ -3704,6 +3671,7 @@ Handle<StackFrameInfo> Factory::NewStackFrameInfo(
 
   int line = frame->GetLineNumber();
   int column = frame->GetColumnNumber();
+  int wasm_function_index = frame->GetWasmFunctionIndex();
 
   const int script_id = frame->GetScriptId();
 
@@ -3755,6 +3723,7 @@ Handle<StackFrameInfo> Factory::NewStackFrameInfo(
   info->set_is_user_java_script(is_user_java_script);
   info->set_line_number(line);
   info->set_column_number(column);
+  info->set_wasm_function_index(wasm_function_index);
   info->set_script_id(script_id);
 
   info->set_script_name(*script_name);
@@ -3910,7 +3879,9 @@ void Factory::SetRegExpAtomData(Handle<JSRegExp> regexp, JSRegExp::Type type,
 
 void Factory::SetRegExpIrregexpData(Handle<JSRegExp> regexp,
                                     JSRegExp::Type type, Handle<String> source,
-                                    JSRegExp::Flags flags, int capture_count) {
+                                    JSRegExp::Flags flags, int capture_count,
+                                    uint32_t backtrack_limit) {
+  DCHECK(Smi::IsValid(backtrack_limit));
   Handle<FixedArray> store = NewFixedArray(JSRegExp::kIrregexpDataSize);
   Smi uninitialized = Smi::FromInt(JSRegExp::kUninitializedValue);
   Smi ticks_until_tier_up = FLAG_regexp_tier_up
@@ -3927,6 +3898,7 @@ void Factory::SetRegExpIrregexpData(Handle<JSRegExp> regexp,
   store->set(JSRegExp::kIrregexpCaptureCountIndex, Smi::FromInt(capture_count));
   store->set(JSRegExp::kIrregexpCaptureNameMapIndex, uninitialized);
   store->set(JSRegExp::kIrregexpTicksUntilTierUpIndex, ticks_until_tier_up);
+  store->set(JSRegExp::kIrregexpBacktrackLimit, Smi::FromInt(backtrack_limit));
   regexp->set_data(*store);
 }
 

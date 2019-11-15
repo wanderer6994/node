@@ -24,13 +24,6 @@ using VarState = LiftoffAssembler::VarState;
 
 namespace {
 
-#define __ asm_->
-
-#define TRACE(...)                                            \
-  do {                                                        \
-    if (FLAG_trace_liftoff) PrintF("[liftoff] " __VA_ARGS__); \
-  } while (false)
-
 class StackTransferRecipe {
   struct RegisterMove {
     LiftoffRegister src;
@@ -401,12 +394,12 @@ void InitMergeRegion(LiftoffAssembler::CacheState* state,
     }
     if (!reg) {
       // No free register; make this a stack slot.
-      *target = VarState(source->type());
+      *target = VarState(source->type(), source->offset());
       continue;
     }
     if (reuse_registers) register_reuse_map.Add(source->reg(), *reg);
     state->inc_used(*reg);
-    *target = VarState(source->type(), *reg);
+    *target = VarState(source->type(), *reg, source->offset());
   }
 }
 
@@ -484,8 +477,6 @@ constexpr AssemblerOptions DefaultLiftoffOptions() {
 
 }  // namespace
 
-// TODO(clemensb): Provide a reasonably sized buffer, based on wasm function
-// size.
 LiftoffAssembler::LiftoffAssembler(std::unique_ptr<AssemblerBuffer> buffer)
     : TurboAssembler(nullptr, DefaultLiftoffOptions(), CodeObjectRequired::kNo,
                      std::move(buffer)) {
@@ -688,7 +679,7 @@ void LiftoffAssembler::PrepareCall(FunctionSig* sig,
       *target = new_target.gp();
     } else {
       stack_slots.Add(LiftoffAssembler::VarState(LiftoffAssembler::kWasmIntPtr,
-                                                 LiftoffRegister(*target)));
+                                                 LiftoffRegister(*target), 0));
       *target = no_reg;
     }
   }
@@ -858,9 +849,6 @@ std::ostream& operator<<(std::ostream& os, VarState slot) {
   }
   UNREACHABLE();
 }
-
-#undef __
-#undef TRACE
 
 }  // namespace wasm
 }  // namespace internal
